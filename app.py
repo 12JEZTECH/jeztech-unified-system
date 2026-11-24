@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from jose import jwt, JWTError
-from sqlalchemy import create_engine, String, Integer, Text, DateTime, ForeignKey
+from sqlalchemy import update, create_engine, String, Integer, Text, DateTime, ForeignKey
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 
 DATABASE_URL=os.getenv("DATABASE_URL","sqlite:///./jeztech_learning.db")
@@ -24,6 +24,12 @@ class Record(Base):
 class Submission(Base):
     __tablename__="submissions"
     id:Mapped[int]=mapped_column(primary_key=True); record_id:Mapped[int]=mapped_column(Integer,index=True); student_id:Mapped[int]=mapped_column(Integer,index=True); content:Mapped[str]=mapped_column(Text,default=""); score:Mapped[Optional[int]]=mapped_column(Integer,nullable=True); feedback:Mapped[str]=mapped_column(Text,default=""); created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+class PasswordReset(Base):
+    __tablename__="password_resets"
+    digest:Mapped[str]=mapped_column(String(64),primary_key=True)
+    user_id:Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
+    expires:Mapped[datetime]=mapped_column(DateTime)
+    used:Mapped[int]=mapped_column(Integer,default=0)
 Base.metadata.create_all(engine)
 app=FastAPI(title="JEZTECH Learning API",version="1.0.0")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
@@ -114,4 +120,51 @@ def dashboard(u:User=Depends(current),s:Session=Depends(db)):
     return {"role":u.role,"courses":s.query(Record).filter_by(kind="course").count(),"lessons":s.query(Record).filter_by(kind="lesson").count(),"assignments":s.query(Record).filter_by(kind="assignment").count(),"exams":s.query(Record).filter_by(kind="exam").count(),"submissions":s.query(Submission).count()}
 @app.get("/")
 def home(): return FileResponse("static/index.html")
+@app.post("/api/auth/recovery")
+def recovery(data:dict,s:Session=Depends(db)):
+    import smtplib
+    from email.message import EmailMessage
+    email=str(data.get("email","")).strip().lower()
+    host=os.getenv("SMTP_HOST")
+    sender=os.getenv("SMTP_FROM")
+    origin=os.getenv("PUBLIC_BASE_URL","https://jeztech-learning.onrender.com")
+    if not host or not sender or not origin.startswith("https://"):
+        raise HTTPException(503,"Recovery email service is not configured")
+    u=s.query(User).filter_by(email=email).first()
+    result={"message":"If the account exists, a recovery link will be sent."}
+    if not u: return result
+    now=datetime.utcnow()
+    if s.query(PasswordReset).filter(PasswordReset.user_id==u.id,PasswordReset.expires>now+timedelta(minutes=14)).first(): return result
+    raw=secrets.token_urlsafe(32)
+    s.add(PasswordReset(digest=hashlib.sha256(raw.encode()).hexdigest(),user_id=u.id,expires=now+timedelta(minutes=15)))
+    s.commit()
+    msg=EmailMessage()
+    msg["From"]=sender
+    msg["To"]=u.email
+    msg["Subject"]="JEZTECH Learning password reset"
+    msg.set_content("Reset your password within 15 minutes: "+origin.rstrip("/")+"/static/recovery.html#"+raw+"\nIf you did not request this, ignore this email.")
+    try:
+        with smtplib.SMTP_SSL(host,int(os.getenv("SMTP_PORT","465")),timeout=10) as smtp:
+            if os.getenv("SMTP_USER"): smtp.login(os.environ["SMTP_USER"],os.environ["SMTP_PASSWORD"])
+            smtp.send_message(msg)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Recovery email delivery failed")
+    return result
+@app.post("/api/auth/reset")
+def reset_password(data:dict,s:Session=Depends(db)):
+    raw=str(data.get("token",""))
+    password=str(data.get("password",""))
+    if not 12<=len(password)<=128: raise HTTPException(400,"Use 12 to 128 characters")
+    digest=hashlib.sha256(raw.encode()).hexdigest()
+    row=s.get(PasswordReset,digest)
+    if not row: raise HTTPException(400,"Invalid or expired link")
+    result=s.execute(update(PasswordReset).where(PasswordReset.digest==digest,PasswordReset.used==0,PasswordReset.expires>datetime.utcnow()).values(used=1))
+    if result.rowcount!=1: raise HTTPException(400,"Invalid or expired link")
+    u=s.get(User,row.user_id)
+    if not u: raise HTTPException(400,"Invalid or expired link")
+    u.password_hash=ph(password)
+    s.execute(update(PasswordReset).where(PasswordReset.user_id==u.id).values(used=1))
+    s.commit()
+    return {"message":"Password changed. Sign in with your new password."}
 app.mount("/static",StaticFiles(directory="static"),name="static")
