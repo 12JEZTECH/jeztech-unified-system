@@ -41,6 +41,12 @@ class TuitionPayment(Base):
     amount:Mapped[int]=mapped_column(Integer,default=400)
     verified:Mapped[int]=mapped_column(Integer,default=0)
     created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+class ManualTuition(Base):
+    __tablename__="manual_tuition"
+    code:Mapped[str]=mapped_column(String(32),primary_key=True)
+    user_id:Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
+    status:Mapped[str]=mapped_column(String(24),default="pending")
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
 Base.metadata.create_all(engine)
 app=FastAPI(title="JEZTECH Learning API",version="1.0.0")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
@@ -243,4 +249,21 @@ def tuition_verify(data:dict,u:User=Depends(allow("student")),s:Session=Depends(
         else: s.add(TuitionAccess(user_id=u.id,expires=now+timedelta(days=7)))
         s.commit()
     return {"verified":True}
+@app.post("/api/tuition/manual")
+def manual_tuition(data:dict,u:User=Depends(allow("student")),s:Session=Depends(db)):
+    import re
+    from sqlalchemy.exc import IntegrityError
+    code=str(data.get("code","")).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{10}",code): raise HTTPException(400,"Enter the 10-character M-Pesa transaction code")
+    if s.query(ManualTuition).filter(ManualTuition.user_id==u.id,ManualTuition.created_at>datetime.utcnow()-timedelta(minutes=1)).first(): raise HTTPException(429,"Please wait before submitting another code")
+    s.add(ManualTuition(code=code,user_id=u.id,status="pending"))
+    try: s.commit()
+    except IntegrityError: raise HTTPException(409,"Code already submitted; contact support if necessary")
+    return {"status":"pending","message":"Code received. Access remains unchanged until payment is verified."}
+@app.get("/api/tuition/manual")
+def manual_status(u:User=Depends(allow("student")),s:Session=Depends(db)):
+    return [{"code":p.code,"status":p.status} for p in s.query(ManualTuition).filter_by(user_id=u.id).all()]
+@app.get("/api/admin/tuition/manual")
+def manual_queue(u:User=Depends(allow("admin")),s:Session=Depends(db)):
+    return [{"code":p.code,"reference":"JZ"+str(p.user_id),"status":p.status,"submitted":p.created_at.isoformat()} for p in s.query(ManualTuition).all()]
 app.mount("/static",StaticFiles(directory="static"),name="static")
