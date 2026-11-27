@@ -266,4 +266,34 @@ def manual_status(u:User=Depends(allow("student")),s:Session=Depends(db)):
 @app.get("/api/admin/tuition/manual")
 def manual_queue(u:User=Depends(allow("admin")),s:Session=Depends(db)):
     return [{"code":p.code,"reference":"JZ"+str(p.user_id),"status":p.status,"submitted":p.created_at.isoformat()} for p in s.query(ManualTuition).all()]
+class ManualTuitionReview(Base):
+    __tablename__="manual_tuition_reviews"
+    code:Mapped[str]=mapped_column(ForeignKey("manual_tuition.code"),primary_key=True)
+    admin_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
+    evidence:Mapped[str]=mapped_column(Text)
+    decision:Mapped[str]=mapped_column(String(24))
+    reviewed_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+ManualTuitionReview.__table__.create(engine,checkfirst=True)
+@app.post("/api/admin/tuition/manual/{code}/review")
+def review_manual(code:str,data:dict,u:User=Depends(allow("admin")),s:Session=Depends(db)):
+    p=s.get(ManualTuition,code.strip().upper())
+    if not p: raise HTTPException(404,"Submission not found")
+    decision=data.get("decision")
+    evidence=str(data.get("evidence","")).strip()
+    if decision not in ("approved","rejected") or not 10<=len(evidence)<=2000:
+        raise HTTPException(400,"Decision and statement evidence required")
+    if decision=="approved" and (data.get("amount")!=400 or data.get("paybill")!="522533" or data.get("reference")!="JZ"+str(p.user_id)):
+        raise HTTPException(400,"Confirm exact amount, Paybill and learner reference from merchant statement")
+    learner=s.query(User).filter_by(id=p.user_id,role="student").with_for_update().first()
+    if not learner: raise HTTPException(409,"Learner account unavailable")
+    changed=s.execute(update(ManualTuition).where(ManualTuition.code==p.code,ManualTuition.status=="pending").values(status=decision))
+    if changed.rowcount!=1: raise HTTPException(409,"Already reviewed")
+    if decision=="approved":
+        a=s.query(TuitionAccess).filter_by(user_id=p.user_id).with_for_update().first()
+        now=datetime.utcnow()
+        if a: a.expires=max(now,a.expires)+timedelta(days=7)
+        else: s.add(TuitionAccess(user_id=p.user_id,expires=now+timedelta(days=7)))
+    s.add(ManualTuitionReview(code=p.code,admin_id=u.id,evidence=evidence,decision=decision))
+    s.commit()
+    return {"status":decision}
 app.mount("/static",StaticFiles(directory="static"),name="static")
