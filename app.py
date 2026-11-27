@@ -30,6 +30,17 @@ class PasswordReset(Base):
     user_id:Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
     expires:Mapped[datetime]=mapped_column(DateTime)
     used:Mapped[int]=mapped_column(Integer,default=0)
+class TuitionAccess(Base):
+    __tablename__="tuition_access"
+    user_id:Mapped[int]=mapped_column(ForeignKey("users.id"),primary_key=True)
+    expires:Mapped[datetime]=mapped_column(DateTime)
+class TuitionPayment(Base):
+    __tablename__="tuition_payments"
+    checkout:Mapped[str]=mapped_column(String(160),primary_key=True)
+    user_id:Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
+    amount:Mapped[int]=mapped_column(Integer,default=400)
+    verified:Mapped[int]=mapped_column(Integer,default=0)
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
 Base.metadata.create_all(engine)
 app=FastAPI(title="JEZTECH Learning API",version="1.0.0")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
@@ -167,4 +178,69 @@ def reset_password(data:dict,s:Session=Depends(db)):
     s.execute(update(PasswordReset).where(PasswordReset.user_id==u.id).values(used=1))
     s.commit()
     return {"message":"Password changed. Sign in with your new password."}
+def daraja(path, payload=None):
+    import urllib.request, json, base64
+    if os.getenv("MPESA_LIVE_ENABLED")!="true":
+        raise HTTPException(503,"Live payment verification is not enabled")
+    base="https://api.safaricom.co.ke"
+    try:
+        auth=base64.b64encode((os.environ["MPESA_CONSUMER_KEY"]+":"+os.environ["MPESA_CONSUMER_SECRET"]).encode()).decode()
+        req=urllib.request.Request(base+"/oauth/v1/generate?grant_type=client_credentials",headers={"Authorization":"Basic "+auth})
+        with urllib.request.urlopen(req,timeout=15) as response: access=json.load(response)["access_token"]
+        req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Authorization":"Bearer "+access,"Content-Type":"application/json"})
+        with urllib.request.urlopen(req,timeout=20) as response: return json.load(response)
+    except Exception:
+        raise HTTPException(502,"Payment provider unavailable")
+def stk_credentials():
+    import base64
+    from zoneinfo import ZoneInfo
+    stamp=datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y%m%d%H%M%S")
+    key=os.getenv("MPESA_PASSKEY")
+    if not key: raise HTTPException(503,"Payment credentials unavailable")
+    return {"BusinessShortCode":"522533","Password":base64.b64encode(("522533"+key+stamp).encode()).decode(),"Timestamp":stamp}
+@app.get("/api/tuition/status")
+def tuition_status(u:User=Depends(allow("student")),s:Session=Depends(db)):
+    a=s.get(TuitionAccess,u.id)
+    return {"reference":"JZ"+str(u.id),"amount":400,"paybill":"522533","active":bool(a and a.expires>datetime.utcnow()),"expires":a.expires.isoformat()+"Z" if a else None}
+@app.post("/api/tuition/trial")
+def tuition_trial(u:User=Depends(allow("student")),s:Session=Depends(db)):
+    from sqlalchemy.exc import IntegrityError
+    if s.get(TuitionAccess,u.id): raise HTTPException(409,"Trial already claimed or subscription exists")
+    s.add(TuitionAccess(user_id=u.id,expires=datetime.utcnow()+timedelta(hours=24)))
+    try: s.commit()
+    except IntegrityError: raise HTTPException(409,"Trial already claimed")
+    return {"active":True}
+@app.post("/api/tuition/pay")
+def tuition_pay(data:dict,u:User=Depends(allow("student")),s:Session=Depends(db)):
+    import re
+    phone=str(data.get("phone","")).strip()
+    if not re.fullmatch(r"254[17][0-9]{8}",phone): raise HTTPException(400,"Use a Kenyan phone number starting 254")
+    callback=os.getenv("MPESA_CALLBACK_URL","")
+    if callback!="https://jeztech-learning.onrender.com/api/tuition/callback": raise HTTPException(503,"Callback configuration required")
+    if s.query(TuitionPayment).filter(TuitionPayment.user_id==u.id,TuitionPayment.created_at>datetime.utcnow()-timedelta(minutes=2)).first(): raise HTTPException(429,"Wait before requesting another payment")
+    result=daraja("/mpesa/stkpush/v1/processrequest",{**stk_credentials(),"TransactionType":"CustomerPayBillOnline","Amount":400,"PartyA":phone,"PartyB":"522533","PhoneNumber":phone,"CallBackURL":callback,"AccountReference":"JZ"+str(u.id),"TransactionDesc":"Weekly tuition"})
+    if str(result.get("ResponseCode"))!="0" or not result.get("CheckoutRequestID"): raise HTTPException(502,"Payment request rejected")
+    p=TuitionPayment(checkout=result["CheckoutRequestID"],user_id=u.id,amount=400)
+    s.add(p);s.commit()
+    return {"checkout":p.checkout}
+@app.post("/api/tuition/callback")
+def tuition_callback(data:dict):
+    # Callback is untrusted; never grant access based on its contents.
+    return {"ResultCode":0,"ResultDesc":"Accepted"}
+@app.post("/api/tuition/verify")
+def tuition_verify(data:dict,u:User=Depends(allow("student")),s:Session=Depends(db)):
+    checkout=str(data.get("checkout",""))
+    p=s.get(TuitionPayment,checkout)
+    if not p or p.user_id!=u.id: raise HTTPException(404,"Payment not found")
+    if p.verified: return {"verified":True}
+    result=daraja("/mpesa/stkpushquery/v1/query",{**stk_credentials(),"CheckoutRequestID":checkout})
+    if str(result.get("ResultCode"))!="0" or result.get("CheckoutRequestID")!=checkout: return {"verified":False}
+    changed=s.execute(update(TuitionPayment).where(TuitionPayment.checkout==checkout,TuitionPayment.verified==0).values(verified=1))
+    if changed.rowcount==1:
+        a=s.query(TuitionAccess).filter_by(user_id=u.id).with_for_update().first()
+        now=datetime.utcnow()
+        if a: a.expires=max(now,a.expires)+timedelta(days=7)
+        else: s.add(TuitionAccess(user_id=u.id,expires=now+timedelta(days=7)))
+        s.commit()
+    return {"verified":True}
 app.mount("/static",StaticFiles(directory="static"),name="static")
