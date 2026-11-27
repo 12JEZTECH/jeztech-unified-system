@@ -296,4 +296,25 @@ def review_manual(code:str,data:dict,u:User=Depends(allow("admin")),s:Session=De
     s.add(ManualTuitionReview(code=p.code,admin_id=u.id,evidence=evidence,decision=decision))
     s.commit()
     return {"status":decision}
+class LearnerRecoveryAudit(Base):
+    __tablename__="learner_recovery_audit"
+    id:Mapped[int]=mapped_column(primary_key=True)
+    learner_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
+    admin_id:Mapped[int]=mapped_column(ForeignKey("users.id"))
+    reason:Mapped[str]=mapped_column(Text)
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+LearnerRecoveryAudit.__table__.create(engine,checkfirst=True)
+@app.post("/api/admin/learners/{learner_id}/recovery")
+def assisted_recovery(learner_id:int,data:dict,u:User=Depends(allow("admin")),s:Session=Depends(db)):
+    reason=str(data.get("reason","")).strip()
+    if not 10<=len(reason)<=1000 or data.get("identity_confirmed") is not True:
+        raise HTTPException(400,"Confirm learner identity and provide recovery reason")
+    learner=s.query(User).filter_by(id=learner_id,role="student").with_for_update().first()
+    if not learner: raise HTTPException(404,"Learner not found")
+    raw=secrets.token_urlsafe(32)
+    s.execute(update(PasswordReset).where(PasswordReset.user_id==learner.id).values(used=1))
+    s.add(PasswordReset(digest=hashlib.sha256(raw.encode()).hexdigest(),user_id=learner.id,expires=datetime.utcnow()+timedelta(minutes=15)))
+    s.add(LearnerRecoveryAudit(learner_id=learner.id,admin_id=u.id,reason=reason))
+    s.commit()
+    return {"recovery_url":"https://jeztech-learning.onrender.com/static/recovery.html#"+raw,"expires_minutes":15}
 app.mount("/static",StaticFiles(directory="static"),name="static")
